@@ -24,9 +24,10 @@ const createOrder = async (req, res) => {
     const order = orderResult.rows[0];
 
     await client.query(
-      `INSERT INTO order_status_history (order_id, status)
-       VALUES ($1, $2)`,
-      [order.id, order.status]
+      `INSERT INTO order_status_history
+       (order_id, from_status, to_status, changed_by)
+       VALUES ($1, $2, $3, $4)`,
+      [order.id, null, order.status, customer_id]
     );
 
     await client.query("COMMIT");
@@ -39,9 +40,10 @@ const createOrder = async (req, res) => {
 
     res.status(500).json({
       message: "Failed to create order",
-      error: error.code === "23505"
-        ? "Order number already exists"
-        : undefined,
+      error:
+        error.code === "23505"
+          ? "Order number already exists"
+          : error.message,
     });
   } finally {
     client.release();
@@ -112,7 +114,7 @@ const updateOrderStatus = async (req, res) => {
 
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status, changed_by } = req.body;
 
     const validStatuses = [
       "PLACED",
@@ -129,7 +131,31 @@ const updateOrderStatus = async (req, res) => {
       });
     }
 
+    if (!changed_by) {
+      return res.status(400).json({
+        message: "changed_by is required",
+      });
+    }
+
     await client.query("BEGIN");
+
+    const currentOrderResult = await client.query(
+      `SELECT status
+       FROM orders
+       WHERE id = $1
+       FOR UPDATE`,
+      [id]
+    );
+
+    if (currentOrderResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        message: "Order not found",
+      });
+    }
+
+    const currentStatus = currentOrderResult.rows[0].status;
 
     const orderResult = await client.query(
       `
@@ -141,20 +167,13 @@ const updateOrderStatus = async (req, res) => {
       [status, id]
     );
 
-    if (orderResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-
-      return res.status(404).json({
-        message: "Order not found",
-      });
-    }
-
     await client.query(
       `
-      INSERT INTO order_status_history (order_id, status)
-      VALUES ($1, $2)
+      INSERT INTO order_status_history
+      (order_id, from_status, to_status, changed_by)
+      VALUES ($1, $2, $3, $4)
       `,
-      [id, status]
+      [id, currentStatus, status, changed_by]
     );
 
     await client.query("COMMIT");
@@ -167,6 +186,7 @@ const updateOrderStatus = async (req, res) => {
 
     res.status(500).json({
       message: "Failed to update order status",
+      error: error.message,
     });
   } finally {
     client.release();
@@ -177,10 +197,16 @@ const getOrderHistory = async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT *
+      SELECT
+        id,
+        order_id,
+        from_status,
+        to_status,
+        changed_by,
+        changed_at
       FROM order_status_history
       WHERE order_id = $1
-      ORDER BY created_at ASC
+      ORDER BY changed_at ASC
       `,
       [req.params.id]
     );
